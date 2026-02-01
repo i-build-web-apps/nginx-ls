@@ -1,0 +1,403 @@
+#!/usr/bin/env bash
+#
+# nginx-ls - List nginx domains, webroots, and proxy targets
+# https://github.com/i-build-web-apps/nginx-ls
+#
+# One command. Zero dependencies. Instant overview of your nginx routing.
+
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="nginx-ls"
+
+# Defaults
+SOURCE="auto"
+CONTAINER=""
+USE_COLOR="auto"
+SHOW_HEADER=true
+SHOW_ALL=false
+
+# Colors
+C_RESET=""
+C_HEADER=""
+C_DOMAIN=""
+C_SSL=""
+C_PROXY=""
+C_STATIC=""
+C_DIM=""
+
+setup_colors() {
+    if [[ "$USE_COLOR" == "never" ]]; then
+        return
+    fi
+    if [[ "$USE_COLOR" == "always" ]] || [[ -t 1 ]]; then
+        C_RESET=$'\033[0m'
+        C_HEADER=$'\033[1;37m'
+        C_DOMAIN=$'\033[1;36m'
+        C_SSL=$'\033[1;32m'
+        C_PROXY=$'\033[0;33m'
+        C_STATIC=$'\033[0;35m'
+        C_DIM=$'\033[0;90m'
+    fi
+}
+
+usage() {
+    cat <<EOF
+${PROG} v${VERSION} - List nginx domains, webroots, and proxy targets
+
+USAGE
+    ${PROG} [OPTIONS]
+
+SOURCES (mutually exclusive)
+    (default)              Auto-detect local nginx or Docker container
+    -c, --container NAME   Read config from a Docker container
+    -s, --stdin            Read nginx -T output from stdin
+
+OPTIONS
+    --no-color             Disable colored output
+    --color                Force colored output (even when piped)
+    --no-header            Skip the table header
+    -a, --all              Include catch-all/default server blocks
+    -h, --help             Show this help
+    -v, --version          Show version
+
+EXAMPLES
+    ${PROG}                                     # auto-detect
+    ${PROG} -c nginx-proxy                      # from Docker container
+    ssh prod 'nginx -T 2>&1' | ${PROG} -s      # from remote host
+    ${PROG} -s < /path/to/nginx-t-output.txt    # from file
+    docker exec my-nginx nginx -T 2>&1 | ${PROG} -s  # manual docker pipe
+EOF
+}
+
+die() {
+    echo "${PROG}: error: $*" >&2
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c|--container)
+                [[ -n "${2:-}" ]] || die "--container requires a name"
+                SOURCE="docker"
+                CONTAINER="$2"
+                shift 2
+                ;;
+            -s|--stdin)
+                SOURCE="stdin"
+                shift
+                ;;
+            --no-color)
+                USE_COLOR="never"
+                shift
+                ;;
+            --color)
+                USE_COLOR="always"
+                shift
+                ;;
+            --no-header)
+                SHOW_HEADER=false
+                shift
+                ;;
+            -a|--all)
+                SHOW_ALL=true
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "${PROG} v${VERSION}"
+                exit 0
+                ;;
+            *)
+                die "unknown option: $1"
+                ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Config source detection
+# ---------------------------------------------------------------------------
+get_nginx_config() {
+    case "$SOURCE" in
+        stdin)
+            cat
+            ;;
+        docker)
+            if ! command -v docker &>/dev/null; then
+                die "docker is not installed"
+            fi
+            if ! docker inspect "$CONTAINER" &>/dev/null; then
+                die "container '$CONTAINER' not found"
+            fi
+            docker exec "$CONTAINER" nginx -T 2>&1
+            ;;
+        auto)
+            # Try local nginx first
+            if command -v nginx &>/dev/null; then
+                nginx -T 2>&1
+                return
+            fi
+            # Try to find a running Docker nginx container
+            if command -v docker &>/dev/null; then
+                local cid
+                cid=$(docker ps --filter "ancestor=nginx" --filter "status=running" --format '{{.Names}}' 2>/dev/null | head -1)
+                if [[ -z "$cid" ]]; then
+                    # Fallback: look for containers with 'nginx' in the image name
+                    cid=$(docker ps --filter "status=running" --format '{{.Names}}\t{{.Image}}' 2>/dev/null \
+                        | awk -F'\t' '$2 ~ /nginx/ {print $1; exit}')
+                fi
+                if [[ -n "$cid" ]]; then
+                    echo "# auto-detected Docker container: ${cid}" >&2
+                    docker exec "$cid" nginx -T 2>&1
+                    return
+                fi
+            fi
+            die "no nginx found locally or in Docker containers"
+            ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# Parse nginx -T output and produce tab-separated records
+# ---------------------------------------------------------------------------
+parse_config() {
+    awk '
+    BEGIN {
+        depth = 0
+        in_server = 0
+        in_location = 0
+        server_name = ""
+        listen_ports = ""
+        has_ssl = 0
+        root_dir = ""
+        proxy_target = ""
+        location_path = ""
+        got_root_proxy = 0
+    }
+
+    # Track brace depth
+    /{/ {
+        # Count opening braces on this line
+        line = $0
+        while (match(line, /{/)) {
+            depth++
+            line = substr(line, RSTART + 1)
+        }
+    }
+
+    /}/ {
+        line = $0
+        closing = 0
+        while (match(line, /}/)) {
+            closing++
+            line = substr(line, RSTART + 1)
+        }
+
+        # Check if we are closing a location block
+        for (i = 0; i < closing; i++) {
+            if (in_location && depth - i == location_depth) {
+                in_location = 0
+            }
+        }
+
+        # Check if we are closing a server block
+        for (i = 0; i < closing; i++) {
+            if (in_server && depth - i == server_depth) {
+                # Emit record
+                if (server_name != "") {
+                    listen_str = listen_ports
+                    if (has_ssl) listen_str = listen_str " ssl"
+
+                    if (proxy_target != "") {
+                        type_str = "proxy"
+                        target = proxy_target
+                    } else if (root_dir != "") {
+                        type_str = "static"
+                        target = root_dir
+                    } else {
+                        type_str = "-"
+                        target = "-"
+                    }
+
+                    print server_name "\t" listen_str "\t" type_str "\t" target
+                }
+
+                # Reset
+                in_server = 0
+                server_name = ""
+                listen_ports = ""
+                has_ssl = 0
+                root_dir = ""
+                proxy_target = ""
+                got_root_proxy = 0
+            }
+        }
+
+        depth -= closing
+        if (depth < 0) depth = 0
+    }
+
+    # Detect server block start
+    /^[[:space:]]*server[[:space:]]*\{/ {
+        in_server = 1
+        server_depth = depth  # depth was already incremented above
+    }
+
+    !in_server { next }
+
+    # Detect location block
+    /^[[:space:]]*location[[:space:]]/ {
+        in_location = 1
+        location_depth = depth
+        # Extract location path (POSIX-compatible)
+        lp = $0
+        gsub(/^[[:space:]]*location[[:space:]]+/, "", lp)
+        gsub(/[[:space:]]*\{.*/, "", lp)
+        # Strip optional modifier (= ~ ~* ^~)
+        gsub(/^[=~^]+[[:space:]]*/, "", lp)
+        location_path = (lp != "") ? lp : "/"
+    }
+
+    # Capture server_name
+    /^[[:space:]]*server_name[[:space:]]/ {
+        gsub(/^[[:space:]]*server_name[[:space:]]+/, "")
+        gsub(/;[[:space:]]*$/, "")
+        server_name = $0
+    }
+
+    # Capture listen directives - collect unique ports
+    /^[[:space:]]*listen[[:space:]]/ {
+        gsub(/^[[:space:]]*listen[[:space:]]+/, "")
+        gsub(/;[[:space:]]*$/, "")
+        val = $0
+        if (val ~ /ssl/) has_ssl = 1
+
+        # Extract port number
+        port = val
+        gsub(/[[:space:]].*/, "", port)      # drop everything after first space
+        gsub(/.*:/, "", port)                 # drop address prefix (e.g., [::]:)
+
+        # Add port if not already in list
+        if (listen_ports == "") {
+            listen_ports = port
+        } else if (index("," listen_ports ",", "," port ",") == 0) {
+            listen_ports = listen_ports "," port
+        }
+    }
+
+    # Capture root (prefer server-level, fall back to location-level)
+    /^[[:space:]]*root[[:space:]]/ {
+        if (!in_location || root_dir == "") {
+            gsub(/^[[:space:]]*root[[:space:]]+/, "")
+            gsub(/;[[:space:]]*$/, "")
+            root_dir = $0
+        }
+    }
+
+    # Capture proxy_pass (prefer location / or first found)
+    /^[[:space:]]*proxy_pass[[:space:]]/ {
+        if (!got_root_proxy) {
+            gsub(/^[[:space:]]*proxy_pass[[:space:]]+/, "")
+            gsub(/;[[:space:]]*$/, "")
+            proxy_target = $0
+            # If this is the root location, lock it in
+            if (in_location && location_path == "/") {
+                got_root_proxy = 1
+            }
+        }
+    }
+    '
+}
+
+# ---------------------------------------------------------------------------
+# Format and output
+# ---------------------------------------------------------------------------
+format_output() {
+    local show_all="$1"
+
+    # Read all records into an array
+    local records=()
+    while IFS=$'\t' read -r domain listen type target; do
+        # Skip catch-all/default blocks unless --all
+        if [[ "$show_all" != "true" ]]; then
+            case "$domain" in
+                ""|"_"|'""'|"localhost") continue ;;
+            esac
+        fi
+        records+=("${domain}|${listen}|${type}|${target}")
+    done
+
+    if [[ ${#records[@]} -eq 0 ]]; then
+        echo "${PROG}: no server blocks found" >&2
+        exit 0
+    fi
+
+    # Calculate column widths (cap domain at 50 chars)
+    local max_domain=50
+    local w_domain=6 w_listen=6 w_type=4 w_target=6
+    for rec in "${records[@]}"; do
+        IFS='|' read -r d l t tgt <<< "$rec"
+        local dlen=${#d}
+        (( dlen > max_domain )) && dlen=$max_domain
+        (( dlen > w_domain )) && w_domain=$dlen
+        (( ${#l} > w_listen )) && w_listen=${#l}
+        (( ${#t} > w_type )) && w_type=${#t}
+        (( ${#tgt} > w_target )) && w_target=${#tgt}
+    done
+
+    # Print header
+    if [[ "$SHOW_HEADER" == "true" ]]; then
+        printf "${C_HEADER}%-${w_domain}s  %-${w_listen}s  %-${w_type}s  %s${C_RESET}\n" \
+            "DOMAIN" "LISTEN" "TYPE" "TARGET"
+        printf "${C_DIM}%-${w_domain}s  %-${w_listen}s  %-${w_type}s  %-${w_target}s${C_RESET}\n" \
+            "$(printf '%*s' "$w_domain" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$w_listen" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$w_type" '' | tr ' ' '-')" \
+            "$(printf '%*s' "$w_target" '' | tr ' ' '-')"
+    fi
+
+    # Print rows
+    for rec in "${records[@]}"; do
+        IFS='|' read -r domain listen type target <<< "$rec"
+
+        # Truncate long domain lists
+        if (( ${#domain} > max_domain )); then
+            domain="${domain:0:$((max_domain - 3))}..."
+        fi
+
+        local c_type="$C_DIM"
+        if [[ "$type" == "proxy" ]]; then
+            c_type="$C_PROXY"
+        elif [[ "$type" == "static" ]]; then
+            c_type="$C_STATIC"
+        fi
+
+        local ssl_indicator=""
+        if [[ "$listen" == *ssl* ]]; then
+            ssl_indicator="${C_SSL}"
+        fi
+
+        printf "${C_DOMAIN}%-${w_domain}s${C_RESET}  ${ssl_indicator}%-${w_listen}s${C_RESET}  ${c_type}%-${w_type}s${C_RESET}  ${c_type}%s${C_RESET}\n" \
+            "$domain" "$listen" "$type" "$target"
+    done
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+    parse_args "$@"
+    setup_colors
+
+    get_nginx_config | parse_config | format_output "$SHOW_ALL"
+}
+
+main "$@"
