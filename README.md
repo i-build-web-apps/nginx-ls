@@ -18,17 +18,12 @@ staging.example.com                   443,80 ssl  proxy   http://staging-app:300
 ## Install
 
 ```bash
-# One-liner (run directly from GitHub)
-bash <(curl -fsSL https://raw.githubusercontent.com/i-build-web-apps/nginx-ls/main/nginx-ls) -s < config.txt
+# Download and run (quickest)
+curl -fsSL https://raw.githubusercontent.com/i-build-web-apps/nginx-ls/main/nginx-ls | bash
 
-# Download to PATH
-curl -fsSL https://raw.githubusercontent.com/i-build-web-apps/nginx-ls/main/nginx-ls -o /usr/local/bin/nginx-ls
-chmod +x /usr/local/bin/nginx-ls
-
-# Or clone the repo
-git clone https://github.com/i-build-web-apps/nginx-ls.git
-cd nginx-ls
-sudo cp nginx-ls /usr/local/bin/
+# Install to PATH (permanent)
+sudo curl -fsSL https://raw.githubusercontent.com/i-build-web-apps/nginx-ls/main/nginx-ls -o /usr/local/bin/nginx-ls
+sudo chmod +x /usr/local/bin/nginx-ls
 ```
 
 ### Requirements
@@ -65,28 +60,23 @@ nginx-ls [OPTIONS]
 ## Examples
 
 ```bash
-# Auto-detect (local nginx or Docker)
+# Run on a server with nginx installed
 nginx-ls
 
-# From a specific Docker container
-nginx-ls -c nginx-proxy
+# Run against an nginx Docker container
+nginx-ls -c my-nginx
 
-# From a remote server via SSH
-ssh prod-server 'nginx -T 2>&1' | nginx-ls -s
+# Pipe from a remote server over SSH
+ssh my-server 'nginx -T 2>&1' | nginx-ls -s
 
-# From a saved file
-nginx-ls -s < /path/to/nginx-t-output.txt
+# Pipe from a file
+nginx-ls -s < nginx-config-dump.txt
 
-# Manual Docker pipe
-docker exec my-nginx nginx -T 2>&1 | nginx-ls -s
-
-# Scriptable (no header, no color)
-nginx-ls --no-header --no-color | while read domain listen type target; do
-    echo "Domain: $domain -> $target"
-done
-
-# Include default/catch-all blocks
+# Include catch-all/default server blocks
 nginx-ls --all
+
+# Machine-readable (no header, no color)
+nginx-ls --no-header --no-color
 ```
 
 ## How It Works
